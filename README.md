@@ -25,10 +25,7 @@ This will turn on the red light for 1000 ms, the green light for 500 ms, and the
 
 Here is the demo of the traffic light control system:
 
-<video width="600" controls>
-  <source src="./example.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+https://github.com/user-attachments/assets/54cff3c3-7639-4d98-a164-37968f6c1c53
 
 
 
