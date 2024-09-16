@@ -21,7 +21,15 @@ This project implements a traffic light control system in the Zephyr RTOS enviro
 ## Example:
 
 This will turn on the red light for 1000 ms, the green light for 500 ms, and the yellow light for 1000 ms, repeating the sequence two times.
-![Project Demo](./example.mp4)
+# Project Demo
+
+Here is the demo of the traffic light control system:
+
+<video width="600" controls>
+  <source src="./example.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+
 
 
 ## Structure Description
