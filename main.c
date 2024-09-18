@@ -3,8 +3,11 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/sys/atomic.h>
+#include <zephyr/sys_clock.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 // LED-pinien määritykset
 static const struct gpio_dt_spec red_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);    // Punainen
@@ -42,6 +45,7 @@ struct k_condvar yellow_condvar;
 struct k_condvar green_condvar;
 struct k_mutex led_mutex;    // Suojaa FIFO-puskureita ja condition variableja
 struct k_mutex light_mutex;  // Varmistaa, että vain yksi valo on päällä kerrallaan
+struct k_mutex total_duration_mutex; // Suojaa total_duration_us
 
 // Määrittele komentojono
 K_FIFO_DEFINE(command_queue);
@@ -68,6 +72,20 @@ struct led_item {
     void *fifo_reserved; // Ensimmäinen kenttä varattu kernelille
     int duration;
 };
+
+// Aikamuuttujat
+static uint32_t total_duration_us = 0;
+static uint32_t uart_sequence_start_time = 0;
+static uint32_t uart_sequence_end_time = 0;
+static uint32_t dispatcher_processing_time_us = 0;
+static bool debug_enabled = false;
+
+#define DEBUG_PRINT(fmt, ...) \
+    do { if (debug_enabled) printk(fmt, ##__VA_ARGS__); } while (0)
+
+
+// Sekvenssin suorituksen synkronointiin
+struct k_sem sequence_sem;
 
 // UART-initialisointifunktio
 int init_uart(void) {
@@ -132,6 +150,11 @@ void uart_receive_task(void *p1, void *p2, void *p3) {
     while (true) {
         // Tarkistetaan UART-tulo
         if (uart_poll_in(uart_dev, &rc) == 0) {
+            // Tarkistetaan, että merkki ei ole pieni kirjain eikä piste
+            // Jos merkki on pieni kirjain tai piste, ohjelma pysäytetään (boottaa)
+            assert(!(rc >= 'a' && rc <= 'z'));  // Väärät merkit: pienet kirjaimet
+        assert(rc != '.' && rc != '!' && rc != '@' && rc != '#' && rc != '$' && rc != '%' && rc != '^' && rc != '&' && rc != '*');  // Väärät merkit: piste ja muut erikoismerkit
+
             // Lähetetään merkki takaisin terminaaliin
             uart_poll_out(uart_dev, rc);
 
@@ -140,12 +163,25 @@ void uart_receive_task(void *p1, void *p2, void *p3) {
 
             // Tarkistetaan viestin loppu (rivinvaihto '\n' tai '\r')
             if (rc == '\n' || rc == '\r' || uart_msg_index >= MAX_MSG_LEN) {
-                uart_msg[uart_msg_index - 1] = '\0';  // Lopetetaan merkkijono
+                uart_msg[uart_msg_index - 1] = '\0';  // Lopetetaan viesti
 
-                printk("Received message: %s\n", uart_msg);
+                // Käsitellään 'D' komento debug-tilan vaihtamiseksi
+                if (strcmp(uart_msg, "D,1") == 0) {
+                    debug_enabled = true;
+                    printk("Debugging enabled\n");
+                } else if (strcmp(uart_msg, "D,0") == 0) {
+                    debug_enabled = false;
+                    printk("Debugging disabled\n");
+                } else {
+                    uart_sequence_end_time = k_cycle_get_32();  // Loppuaika, kun viesti on vastaanotettu
+                    uint32_t duration_cycles = uart_sequence_end_time - uart_sequence_start_time;
+                    uint32_t duration_ns = k_cyc_to_ns_floor64(duration_cycles);
+                    uint32_t duration_us = duration_ns / 1000;
+                    DEBUG_PRINT("UART sequence received in %u us\n", duration_us);  // Raportoidaan vastaanottoaika
 
-                // Laitetaan koko viesti ring bufferiin
-                ring_buffer_put(&uart_buffer, uart_msg);
+                    // Asetetaan koko viesti ring bufferiin
+                    ring_buffer_put(&uart_buffer, uart_msg);
+                }
 
                 // Nollataan viesti-indeksi seuraavaa viestiä varten
                 uart_msg_index = 0;
@@ -154,6 +190,7 @@ void uart_receive_task(void *p1, void *p2, void *p3) {
         k_msleep(10);  // Pieni viive, jotta vältetään kiireinen odotus
     }
 }
+
 
 // Dispatcher-tehtävä
 void dispatcher_task(void *p1, void *p2, void *p3) {
@@ -169,7 +206,16 @@ void dispatcher_task(void *p1, void *p2, void *p3) {
     while (true) {
         // Haetaan seuraava viesti ring bufferista
         if (ring_buffer_get(&uart_buffer, msg) == 0) {
-            printk("Dispatcher received message: %s\n", msg);
+            DEBUG_PRINT("Dispatcher received message: %s\n", msg);
+
+            uint32_t start_time = k_cycle_get_32();
+
+            // Resetoi total_duration_us ja komento-laskuri
+            k_mutex_lock(&total_duration_mutex, K_FOREVER);
+            total_duration_us = 0;
+            k_mutex_unlock(&total_duration_mutex);
+
+            int command_count = 0;  // Komentojen määrä tässä sekvenssissä
 
             // Etsitään 'T' viestistä
             char *t_ptr = strchr(msg, 'T');
@@ -181,9 +227,12 @@ void dispatcher_task(void *p1, void *p2, void *p3) {
 
                 // Luetaan toistojen määrä 'T' jälkeen
                 if (sscanf(t_ptr, "T,%d", &repeat_times) != 1) {
-                    printk("Invalid repeat format in message\n");
+                    DEBUG_PRINT("Invalid repeat format in message\n");
                     repeat_times = 1; // Oletusarvo 1, jos jäsennys epäonnistuu
                 }
+
+                // Assert, jotta toistomäärä ei ylitä järkevää arvoa
+                assert(repeat_times >= 1 && repeat_times <= 100);  // Oletetaan, että 100 on maksimi toistomäärä
             } else {
                 // Ei 'T'-merkkiä, käytetään koko viestiä sekvenssinä
                 strcpy(command_sequence, msg);
@@ -196,48 +245,51 @@ void dispatcher_task(void *p1, void *p2, void *p3) {
                 while (*ptr != '\0') {
                     int n = 0;
                     if (sscanf(ptr, "%c,%d%n", &color, &duration, &n) != 2) {
-                        printk("Invalid format in sequence\n");
+                        DEBUG_PRINT("Invalid format in sequence\n");
                         break;
                     }
 
-                    printk("Color: %c, Duration: %d ms\n", color, duration);
+                    DEBUG_PRINT("Color: %c, Duration: %d ms\n", color, duration);
 
                     struct led_item *led_data = k_malloc(sizeof(struct led_item));
-                    if (led_data != NULL) {
-                        led_data->duration = duration;
+                    
+                    // Assert tarkistamaan, että muistiallokaatio onnistuu
+                    assert(led_data != NULL);  // Jos muistia ei voida varata, ohjelma pysäytetään
 
-                        k_mutex_lock(&led_mutex, K_FOREVER);
-                        switch (color) {
-                            case 'R':
-                                k_fifo_put(&red_fifo, led_data);
-                                k_condvar_signal(&red_condvar);
-                                break;
-                            case 'G':
-                                k_fifo_put(&green_fifo, led_data);
-                                k_condvar_signal(&green_condvar);
-                                break;
-                            case 'Y':
-                                k_fifo_put(&yellow_fifo, led_data);
-                                k_condvar_signal(&yellow_condvar);
-                                break;
-                            default:
-                                printk("Unknown color received: %c\n", color);
-                                k_free(led_data);
-                                break;
-                        }
-                        k_mutex_unlock(&led_mutex);
+                    led_data->duration = duration;
 
-                        // Lisää komento command_queue-jonoon
-                        struct command_item *cmd_item = k_malloc(sizeof(struct command_item));
-                        if (cmd_item != NULL) {
-                            cmd_item->color = color;
-                            k_fifo_put(&command_queue, cmd_item);
-                        } else {
-                            printk("Memory allocation failed for command_item\n");
-                        }
-                    } else {
-                        printk("Memory allocation failed for led_item\n");
+                    k_mutex_lock(&led_mutex, K_FOREVER);
+                    switch (color) {
+                        case 'R':
+                            k_fifo_put(&red_fifo, led_data);
+                            k_condvar_signal(&red_condvar);
+                            break;
+                        case 'G':
+                            k_fifo_put(&green_fifo, led_data);
+                            k_condvar_signal(&green_condvar);
+                            break;
+                        case 'Y':
+                            k_fifo_put(&yellow_fifo, led_data);
+                            k_condvar_signal(&yellow_condvar);
+                            break;
+                        default:
+                            DEBUG_PRINT("Unknown color received: %c\n", color);
+                            k_free(led_data);
+                            break;
                     }
+                    k_mutex_unlock(&led_mutex);
+
+                    // Lisää komento command_queue-jonoon
+                    struct command_item *cmd_item = k_malloc(sizeof(struct command_item));
+
+                    // Assert tarkistamaan muistiallokaatio komentoja varten
+                    assert(cmd_item != NULL);  // Jos muistia ei voida varata, ohjelma pysäytetään
+
+                    cmd_item->color = color;
+                    k_fifo_put(&command_queue, cmd_item);
+
+                    // Päivitä komento-laskuri
+                    command_count++;
 
                     ptr += n;  // Siirretään osoitinta eteenpäin jäsennetyn osuuden verran
 
@@ -247,6 +299,26 @@ void dispatcher_task(void *p1, void *p2, void *p3) {
                     }
                 }
             }
+
+            // Alustetaan sekvenssin semafori
+            k_sem_reset(&sequence_sem);
+
+            // Odotetaan, että kaikki valotaskit ovat suorittaneet tehtävänsä
+            for (int i = 0; i < command_count; i++) {
+                k_sem_take(&sequence_sem, K_FOREVER);
+            }
+
+            // Tulostetaan sekvenssin yhteenlaskettu aika
+            k_mutex_lock(&total_duration_mutex, K_FOREVER);
+            DEBUG_PRINT("Total sequence duration: %u us\n", total_duration_us);
+            k_mutex_unlock(&total_duration_mutex);
+
+            uint32_t end_time = k_cycle_get_32();  // Loppumittaus
+            uint32_t duration_cycles = end_time - start_time;
+            uint32_t duration_ns = k_cyc_to_ns_floor64(duration_cycles);
+            dispatcher_processing_time_us = duration_ns / 1000;
+
+            DEBUG_PRINT("Dispatcher processed sequence in %u us\n", dispatcher_processing_time_us);
         }
 
         k_msleep(10);  // Pieni viive, jotta vältetään kiireinen odotus
@@ -285,6 +357,8 @@ void red_light_task(void *p1, void *p2, void *p3) {
         k_mutex_unlock(&led_mutex);
 
         if (item != NULL) {
+            uint32_t start_time = k_cycle_get_32();
+
             k_mutex_lock(&light_mutex, K_FOREVER);
             printk("Red light ON for %d ms\n", item->duration);
             gpio_pin_set_dt(&green_led, 0);  // Varmista, että vihreä LED on pois päältä
@@ -293,6 +367,23 @@ void red_light_task(void *p1, void *p2, void *p3) {
             gpio_pin_set_dt(&red_led, 0);    // Sammuta punainen LED
             printk("Red light OFF\n");
             k_mutex_unlock(&light_mutex);
+
+            uint32_t end_time = k_cycle_get_32();
+            uint32_t duration_cycles = end_time - start_time;
+            uint32_t duration_ns = k_cyc_to_ns_floor64(duration_cycles);
+            uint32_t duration_us = duration_ns / 1000;
+
+            // Päivitä total_duration_us
+            k_mutex_lock(&total_duration_mutex, K_FOREVER);
+            total_duration_us += duration_us;
+            k_mutex_unlock(&total_duration_mutex);
+
+            // Tulosta yksittäisen tehtävän aika
+            printk("Red task duration: %u us\n", duration_us);
+
+            // Ilmoita dispatcherille, että tehtävä on suoritettu
+            k_sem_give(&sequence_sem);
+
             k_free(item);
         }
     }
@@ -330,6 +421,8 @@ void green_light_task(void *p1, void *p2, void *p3) {
         k_mutex_unlock(&led_mutex);
 
         if (item != NULL) {
+            uint32_t start_time = k_cycle_get_32();
+
             k_mutex_lock(&light_mutex, K_FOREVER);
             printk("Green light ON for %d ms\n", item->duration);
             gpio_pin_set_dt(&red_led, 0);    // Varmista, että punainen LED on pois päältä
@@ -338,6 +431,23 @@ void green_light_task(void *p1, void *p2, void *p3) {
             gpio_pin_set_dt(&green_led, 0);  // Sammuta vihreä LED
             printk("Green light OFF\n");
             k_mutex_unlock(&light_mutex);
+
+            uint32_t end_time = k_cycle_get_32();
+            uint32_t duration_cycles = end_time - start_time;
+            uint32_t duration_ns = k_cyc_to_ns_floor64(duration_cycles);
+            uint32_t duration_us = duration_ns / 1000;
+
+            // Päivitä total_duration_us
+            k_mutex_lock(&total_duration_mutex, K_FOREVER);
+            total_duration_us += duration_us;
+            k_mutex_unlock(&total_duration_mutex);
+
+            // Tulosta yksittäisen tehtävän aika
+            printk("Green task duration: %u us\n", duration_us);
+
+            // Ilmoita dispatcherille, että tehtävä on suoritettu
+            k_sem_give(&sequence_sem);
+
             k_free(item);
         }
     }
@@ -375,6 +485,8 @@ void yellow_light_task(void *p1, void *p2, void *p3) {
         k_mutex_unlock(&led_mutex);
 
         if (item != NULL) {
+            uint32_t start_time = k_cycle_get_32();
+
             k_mutex_lock(&light_mutex, K_FOREVER);
             printk("Yellow light (Red + Green) ON for %d ms\n", item->duration);
             gpio_pin_set_dt(&red_led, 1);    // Sytytä punainen LED
@@ -384,6 +496,23 @@ void yellow_light_task(void *p1, void *p2, void *p3) {
             gpio_pin_set_dt(&green_led, 0);  // Sammuta vihreä LED
             printk("Yellow light OFF\n");
             k_mutex_unlock(&light_mutex);
+
+            uint32_t end_time = k_cycle_get_32();
+            uint32_t duration_cycles = end_time - start_time;
+            uint32_t duration_ns = k_cyc_to_ns_floor64(duration_cycles);
+            uint32_t duration_us = duration_ns / 1000;
+
+            // Päivitä total_duration_us
+            k_mutex_lock(&total_duration_mutex, K_FOREVER);
+            total_duration_us += duration_us;
+            k_mutex_unlock(&total_duration_mutex);
+
+            // Tulosta yksittäisen tehtävän aika
+            printk("Yellow task duration: %u us\n", duration_us);
+
+            // Ilmoita dispatcherille, että tehtävä on suoritettu
+            k_sem_give(&sequence_sem);
+
             k_free(item);
         }
     }
@@ -413,6 +542,8 @@ int main(void) {
     k_condvar_init(&green_condvar);
     k_mutex_init(&led_mutex);
     k_mutex_init(&light_mutex); // Uusi muteksi valojen hallintaan
+    k_mutex_init(&total_duration_mutex);
+    k_sem_init(&sequence_sem, 0, UINT_MAX);
 
     // Luo säikeet tehtäville
     k_thread_create(&uart_receive_thread_data, uart_receive_stack, STACK_SIZE,
